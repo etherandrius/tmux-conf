@@ -1,3 +1,7 @@
-*
-!tmux.conf
-!plugins/
+# TPM-managed third-party plugins are installed locally.
+/plugins/*
+
+# Local/obsolete files.
+/deprecated/
+.DS_Store
+*.swp
