@@ -8,7 +8,8 @@ mode=${1:-}
 
 fzf_common=(
   --delimiter=$'\t'
-  --with-nth=2
+  --with-nth=3
+  --expect=ctrl-x
   --layout=reverse
   --height=100%
   --info=inline
@@ -17,7 +18,7 @@ fzf_common=(
 )
 
 pick_session() {
-  local current rows selection target
+  local current rows result key selection switch_target delete_target
   current=$(tmux display-message -p '#{session_id}')
   rows=$(tmux list-sessions -F $'#{session_id}\t#{pane_id}\t#{session_name}')
 
@@ -27,19 +28,32 @@ pick_session() {
     {
       number = $1
       sub(/^\$/, "", number)
-      print $2, ($1 == current ? "* " : "  ") "[" number "] " $3
+      print $2, $1, ($1 == current ? "* " : "  ") "[" number "] " $3
     }' <<< "$rows")
 
-  if ! selection=$(printf '%s\n' "$rows" | fzf "${fzf_common[@]}" \
+  if ! result=$(printf '%s\n' "$rows" | fzf "${fzf_common[@]}" \
       --prompt='session> ' \
-      --header='Enter: switch session  •  Esc: cancel' \
+      --header='Enter: switch  •  Ctrl-X: kill session  •  Esc: cancel' \
       --preview='tmux capture-pane -ep -t {1} -S -1000 2>/dev/null | tail -n "${FZF_PREVIEW_LINES:-50}"' \
       --preview-window='right,60%,wrap'); then
     exit 0
   fi
 
-  target=${selection%%$'\t'*}
-  [[ -n "$target" ]] && tmux switch-client -t "$target"
+  if [[ $result == *$'\n'* ]]; then
+    key=${result%%$'\n'*}
+    selection=${result#*$'\n'}
+  else
+    # fzf --filter (used by tests/scripts) omits the --expect key line.
+    key=''
+    selection=$result
+  fi
+  IFS=$'\t' read -r switch_target delete_target _ <<< "$selection"
+
+  if [[ $key == ctrl-x ]]; then
+    [[ -n "$delete_target" ]] && tmux kill-session -t "$delete_target"
+  else
+    [[ -n "$switch_target" ]] && tmux switch-client -t "$switch_target"
+  fi
 }
 
 window_tree() {
@@ -54,7 +68,8 @@ window_tree() {
     else
       session_marker='  '
     fi
-    printf '%s\t%s▾ %s\n' "$active_pane" "$session_marker" "$session_name"
+    printf '%s\t%s\t%s▾ %s\n' \
+      "$active_pane" "$session_id" "$session_marker" "$session_name"
 
     window_number=0
     while IFS=$'\t' read -r pane_id window_id window_index window_name; do
@@ -69,8 +84,8 @@ window_tree() {
       else
         window_marker='  '
       fi
-      printf '%s\t    %s─ %s%s: %s\n' \
-        "$pane_id" "$branch" "$window_marker" "$window_index" "$window_name"
+      printf '%s\t%s\t    %s─ %s%s: %s\n' \
+        "$pane_id" "$window_id" "$branch" "$window_marker" "$window_index" "$window_name"
     done < <(tmux list-windows -t "$session_id" \
       -F $'#{pane_id}\t#{window_id}\t#{window_index}\t#{window_name}')
   done < <(tmux list-sessions \
@@ -78,23 +93,38 @@ window_tree() {
 }
 
 pick_window() {
-  local current_session current_window rows selection target
+  local current_session current_window rows result key selection switch_target delete_target
   current_session=$(tmux display-message -p '#{session_id}')
   current_window=$(tmux display-message -p '#{window_id}')
   rows=$(window_tree "$current_session" "$current_window")
 
-  if ! selection=$(printf '%s\n' "$rows" | fzf "${fzf_common[@]}" \
+  if ! result=$(printf '%s\n' "$rows" | fzf "${fzf_common[@]}" \
       --prompt='window> ' \
-      --header='Enter: switch window  •  Esc: cancel' \
+      --header='Enter: switch  •  Ctrl-X: kill window/session  •  Esc: cancel' \
       --preview='tmux capture-pane -ep -t {1} -S -1000 2>/dev/null | tail -n "${FZF_PREVIEW_LINES:-50}"' \
       --preview-window='right,60%,wrap'); then
     exit 0
   fi
 
-  # The first hidden field is the selected window's active pane ID. Targeting
-  # the pane lets switch-client move across both sessions and windows at once.
-  target=${selection%%$'\t'*}
-  [[ -n "$target" ]] && tmux switch-client -t "$target"
+  if [[ $result == *$'\n'* ]]; then
+    key=${result%%$'\n'*}
+    selection=${result#*$'\n'}
+  else
+    key=''
+    selection=$result
+  fi
+  IFS=$'\t' read -r switch_target delete_target _ <<< "$selection"
+
+  if [[ $key == ctrl-x ]]; then
+    if [[ $delete_target == @* ]]; then
+      tmux kill-window -t "$delete_target"
+    elif [[ $delete_target == \$* ]]; then
+      tmux kill-session -t "$delete_target"
+    fi
+  else
+    # Targeting the active pane moves across both sessions and windows at once.
+    [[ -n "$switch_target" ]] && tmux switch-client -t "$switch_target"
+  fi
 }
 
 case "$mode" in
