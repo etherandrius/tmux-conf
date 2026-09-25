@@ -20,12 +20,17 @@ sess=$(tmux show -gv @rn_sess 2>/dev/null || true)
 pane=$(tmux show -gv @rn_pane 2>/dev/null || true)
 [ -n "$win" ] || { echo "no source window" >&2; exit 1; }
 
+pi_name=''
+if [ -n "$pane" ]; then
+  pi_name=$(tmux show-options -pqv -t "$pane" @pi_session_name 2>/dev/null || true)
+fi
+
 base=$(basename "$path" 2>/dev/null || true)
 branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
 
 # Suggestions (mirrors the old rename menu); drop empties and dupes, keep order.
 cands=$(printf '%s\n' \
-  "agent-$base" \
+  "$pi_name" \
   "$base" \
   "$cmd" \
   "$cmd-$base" \

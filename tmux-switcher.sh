@@ -2,6 +2,7 @@
 # Fuzzy replacements for tmux's default choose-tree bindings:
 #   <prefix> s  -> sessions
 #   <prefix> w  -> windows across all sessions
+#   <prefix> t  -> live Pi agents across all sessions
 set -euo pipefail
 
 mode=${1:-}
@@ -10,7 +11,7 @@ script_path=$0
 now_epoch=''
 session_format=$'#{session_id}\t#{pane_id}\t#{session_name}\t#{session_windows}\t#{?session_last_attached,#{session_last_attached},0}\t#{?@switcher_color,#{@switcher_color},default}'
 window_format=$'#{session_id}\t#{session_name}\t#{session_windows}\t#{?session_last_attached,#{session_last_attached},0}\t#{?@switcher_color,#{@switcher_color},default}\t#{pane_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{window_stack_index}'
-next_color_format='#{?#{==:#{@switcher_color},red},yellow,#{?#{==:#{@switcher_color},yellow},green,#{?#{==:#{@switcher_color},green},cyan,#{?#{==:#{@switcher_color},cyan},blue,#{?#{==:#{@switcher_color},blue},magenta,#{?#{==:#{@switcher_color},magenta},,red}}}}}}'
+next_color_format='#{?#{==:#{@switcher_color},blue},magenta,#{?#{==:#{@switcher_color},magenta},red,#{?#{==:#{@switcher_color},red},yellow,#{?#{==:#{@switcher_color},yellow},green,#{?#{==:#{@switcher_color},green},cyan,#{?#{==:#{@switcher_color},cyan},,blue}}}}}}'
 
 fzf_common=(
   --delimiter=$'\t'
@@ -66,12 +67,12 @@ relative_time() {
 color_session_name() {
   local color=$1 name=$2 code
   case "$color" in
+    blue) code=34 ;;
+    magenta) code=35 ;;
     red) code=31 ;;
     yellow) code=33 ;;
     green) code=32 ;;
     cyan) code=36 ;;
-    blue) code=34 ;;
-    magenta) code=35 ;;
     *) COLORED_SESSION_NAME=$name; return ;;
   esac
   COLORED_SESSION_NAME=$'\033['"${code}m${name}"$'\033[0m'
@@ -296,8 +297,8 @@ window_tree() {
       [[ $session_id == "$current_session" ]] && session_marker='* ' || session_marker='  '
       relative_time "$last_attached"
       color_session_name "$color" "$session_name"
-      printf '%s\t%s\t%s▾ %s  (%s)\n' \
-        "$pane_id" "$session_id" "$session_marker" "$COLORED_SESSION_NAME" "$RELATIVE_TIME"
+      printf '%s\t%s\t%s▾ %s  (%s)\t%s\n' \
+        "$pane_id" "$session_id" "$session_marker" "$COLORED_SESSION_NAME" "$RELATIVE_TIME" "$session_name"
       previous_session=$session_id
       window_number=0
     fi
@@ -305,8 +306,8 @@ window_tree() {
     window_number=$((window_number + 1))
     ((window_number == window_count)) && branch='└' || branch='├'
     [[ $pane_id == "$current_pane" ]] && window_marker='* ' || window_marker='  '
-    printf '%s\t%s\t    %s─ %s%s: %s\n' \
-      "$pane_id" "$window_id" "$branch" "$window_marker" "$window_index" "$window_name"
+    printf '%s\t%s\t    %s─ %s%s: %s\t%s: %s\n' \
+      "$pane_id" "$window_id" "$branch" "$window_marker" "$window_index" "$window_name" "$window_index" "$window_name"
   done < <(
     while IFS=$'\t' read -r session_id session_name window_count last_attached color pane_id window_id window_index window_name stack_index; do
       [[ $session_id == "$current_session" ]] && rank=0 || rank=1
@@ -319,20 +320,32 @@ window_tree() {
   )
 }
 
-pick_window() {
-  local client context current_session current_window current_pane result bind_color
-  local switch_target delete_id ignored
+pick_window() (
+  local client context current_session current_window current_pane result
+  local switch_target delete_id ignored helper cache_dir snapshot initial
+  local filter_command reload_command recolor_command
 
   now_epoch=$(date +%s)
   context=$(tmux display-message -p $'#{client_name}\t#{session_id}\t#{window_id}\t#{pane_id}')
   IFS=$'\t' read -r client current_session current_window current_pane <<< "$context"
+  helper="$(dirname "$script_path")/tmux_tree_filter.py"
+  cache_dir=$(mktemp -d "${TMPDIR:-/tmp}/tmux-windows.XXXXXX")
+  trap 'rm -rf -- "$cache_dir"' EXIT
+  snapshot="$cache_dir/windows.json"
+  printf -v filter_command 'python3 %q filter %q {q}' "$helper" "$snapshot"
+  printf -v reload_command 'python3 %q update %q {q} -- %q window-rows %q %q' \
+    "$helper" "$snapshot" "$script_path" "$current_session" "$current_pane"
+  printf -v recolor_command 'python3 %q update %q {q} -- %q recolor-rows windows %q %q %q {1}' \
+    "$helper" "$snapshot" "$script_path" "$current_session" "$current_pane" "$now_epoch"
   while :; do
-    bind_color=$(color_binding windows "$current_session" "$current_pane")
-
-    if ! result=$(window_tree "$current_session" "$current_pane" | fzf "${fzf_common[@]}" \
+    # Populate the cache before fzf starts; subsequent typing only filters it.
+    initial=$(python3 "$helper" update "$snapshot" '' -- \
+      "$script_path" window-rows "$current_session" "$current_pane")
+    if ! result=$(printf '%s\n' "$initial" | fzf "${fzf_common[@]}" \
+        --disabled --no-sort --header-lines=1 \
         --prompt='window> ' \
-        --header='Enter: switch  •  Alt-C: colour session  •  Ctrl-X: kill window/session  •  Esc: cancel' \
-        --bind="$bind_color" \
+        --header=$'Enter: switch  •  Alt-C: colour  •  Ctrl-R: rescan\nCtrl-X: kill window/session  •  Esc: cancel' \
+        --bind="start:reload($filter_command),change:reload($filter_command),ctrl-r:reload($reload_command),alt-c:reload($recolor_command)" \
         --preview='tmux capture-pane -ep -t {1} -S "-${FZF_PREVIEW_LINES:-50}" 2>/dev/null' \
         --preview-window='right,60%,wrap'); then
       return
@@ -352,15 +365,17 @@ pick_window() {
     fi
     return
   done
-}
+)
 
 case "$mode" in
   sessions) pick_session ;;
   windows) pick_window ;;
+  agents) exec python3 "$(dirname "$script_path")/tmux-agent-switcher.py" ;;
+  window-rows) now_epoch=$(date +%s); window_tree "${2:?session ID}" "${3:?current pane ID}" ;;
   recolor-rows) recolor_rows "${2:?picker mode}" "${3:?session ID}" "${4:?current pane ID}" "${5:?timestamp}" "${6:?selected pane ID}" ;;
   reopen-after-kill) reopen_after_kill "${2:?picker mode}" "${3:?target}" "${4:?client}" ;;
   *)
-    echo "usage: $0 {sessions|windows}" >&2
+    echo "usage: $0 {sessions|windows|agents}" >&2
     exit 2
     ;;
 esac

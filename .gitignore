@@ -5,3 +5,6 @@
 /deprecated/
 .DS_Store
 *.swp
+
+# Python helper/test bytecode.
+__pycache__/
