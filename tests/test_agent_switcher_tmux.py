@@ -3,6 +3,7 @@
 TMUX_AGENT_INTEGRATION=1 python3 -m unittest discover -s tests -v
 """
 import fcntl
+import json
 import os
 from pathlib import Path
 import pty
@@ -22,6 +23,12 @@ import unittest
                      and shutil.which("tmux") and shutil.which("fzf"), "opt-in tmux/fzf integration")
 class TmuxIntegration(unittest.TestCase):
     def test_popup_refresh_cancel_and_cross_session_navigation(self):
+        self.exercise_popup("pi")
+
+    def test_mixed_pi_claude_popup_and_navigation(self):
+        self.exercise_popup("claude")
+
+    def exercise_popup(self, sibling_kind):
         socket = "agent-switcher-test-" + str(os.getpid())
         env = {**os.environ, "TERM": "xterm-256color"}
         for key in ("TMUX", "TMUX_PANE", "TMUX_AGENT_CLIENT", "FZF_DEFAULT_OPTS", "FZF_DEFAULT_OPTS_FILE"):
@@ -31,6 +38,20 @@ class TmuxIntegration(unittest.TestCase):
             return subprocess.check_output(["tmux", "-L", socket, *args], env=env, text=True).strip()
 
         with tempfile.TemporaryDirectory(prefix="tmux-agent-test-") as directory:
+            env["CLAUDE_CONFIG_DIR"] = str(Path(directory) / "claude-config")
+            env["PI_CODING_AGENT_SESSION_DIR"] = str(Path(directory) / "pi-sessions")
+            claude_session = Path(env["CLAUDE_CONFIG_DIR"]) / "projects/project/session.jsonl"
+
+            def rename_sibling(name):
+                if sibling_kind == "pi":
+                    tmux("set-option", "-p", "-t", sibling, "@pi_session_name", name)
+                else:
+                    claude_session.parent.mkdir(parents=True, exist_ok=True)
+                    records = [dict(type="user", cwd=str(Path(directory).resolve()), sessionId="session",
+                                    message=dict(role="user", content="Integration Claude prompt")),
+                               dict(type="custom-title", customTitle=name)]
+                    claude_session.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
             master, slave = pty.openpty()
             client = None
             try:
@@ -45,8 +66,9 @@ class TmuxIntegration(unittest.TestCase):
                 tmux("set-option", "-p", "-t", target, "@pi_session_name", "integration-agent")
                 sibling = tmux("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "target:",
                                "-c", directory, "bash -c " + shlex.quote(
-                                   command.replace("AGENT SCREEN SENTINEL", "SECOND AGENT SCREEN")))
-                tmux("set-option", "-p", "-t", sibling, "@pi_session_name", "other-agent")
+                                   command.replace("AGENT SCREEN SENTINEL", "SECOND AGENT SCREEN")
+                                   .replace("exec -a pi", "exec -a " + sibling_kind)))
+                rename_sibling("other-agent")
                 switcher = str(Path(__file__).resolve().parents[1] / "tmux-switcher.sh")
                 # Use the same popup binding as tmux.conf, with this checkout's path.
                 tmux("bind-key", "t", "display-popup", "-E", "-w", "100%", "-h", "100%",
@@ -104,10 +126,12 @@ class TmuxIntegration(unittest.TestCase):
                 os.write(master, b"\x02t")
                 wait_for("AGENT SCREEN SENTINEL")
                 # An exact-match query (with a shell quote) retains the heading,
-                # but retargets its preview/navigation to the matching second Pi.
+                # but retargets its preview/navigation to the matching second agent.
                 os.write(master, b"'other-agent")
-                wait_for("SECOND AGENT SCREEN")
-                tmux("set-option", "-p", "-t", sibling, "@pi_session_name", "other-agent-renamed")
+                screen = wait_for("SECOND AGENT SCREEN")
+                if sibling_kind == "claude":
+                    self.assertIn("Claude", screen)
+                rename_sibling("other-agent-renamed")
                 os.write(master, b"\x12")  # Rescan must preserve and reapply the query.
                 wait_for("-renamed")  # tmux may redraw only the changed suffix.
                 os.write(master, b"\x1b[B\r")  # Select the matching child directly.

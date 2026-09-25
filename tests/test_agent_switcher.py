@@ -57,7 +57,7 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_ancestry_cycle_does_not_hang(self):
         processes = {101: process(parent=102), 102: process(102, parent=102, command="bash", args="bash")}
-        self.assertFalse(a.ancestor_is_pi(processes[101], processes))
+        self.assertFalse(a.ancestor_is_agent(processes[101], processes))
 
     def test_linked_window_prefers_current_session(self):
         panes = [pane(session="$1"), pane(session="$2")]
@@ -174,7 +174,7 @@ class SessionTests(unittest.TestCase):
         with patch.object(a, "session_metadata", wraps=a.session_metadata) as metadata, \
              patch.object(a, "session_name", wraps=a.session_name) as names:
             a.match_sessions([item], [self.candidate(old), self.candidate(current, mtime=300)])
-        self.assertEqual(metadata.call_args_list, [unittest.mock.call(current)])
+        self.assertEqual(metadata.call_args_list, [unittest.mock.call(current, "pi")])
         self.assertEqual(names.call_args_list, [unittest.mock.call(current)])
 
     def test_metadata_skips_decoding_old_messages_once_fields_are_known(self):
@@ -217,10 +217,10 @@ class UITests(unittest.TestCase):
         lines = [line.split("\t") for line in result.splitlines()]
         self.assertEqual([line[1] for line in lines], ["$1", "%2", "%1", "$3", "%3"])
         self.assertEqual(lines[0][2], "* ▾ \033[2m(2m ago)\033[0m \033[34mwork\033[0m")
-        self.assertEqual(lines[1][2], "    ├─ * \033[2m~2m ago\033[0m repo \033[2mrepo\033[0m")
-        self.assertEqual(lines[2][2], "    └─   \033[2mtime unknown\033[0m repo \033[2mrepo\033[0m")
+        self.assertEqual(lines[1][2], "    ├─ * \033[2m~2m ago\033[0m repo \033[2m[Pi] repo\033[0m")
+        self.assertEqual(lines[2][2], "    └─   \033[2mtime unknown\033[0m repo \033[2m[Pi] repo\033[0m")
         self.assertEqual(lines[3][2], "  ▾ \033[2m(2m ago)\033[0m \033[34mwork\033[0m")
-        self.assertEqual(lines[4][2], "    └─   \033[2m~2m ago\033[0m repo \033[2mrepo\033[0m")
+        self.assertEqual(lines[4][2], "    └─   \033[2m~2m ago\033[0m repo \033[2m[Pi] repo\033[0m")
         # Both the heading and its first child target the same real Pi pane.
         self.assertEqual(lines[0][0], lines[1][0])
         self.assertEqual(lines[3][0], lines[4][0])
@@ -246,7 +246,7 @@ class UITests(unittest.TestCase):
         self.assertTrue(all(len(row) == 3 for row in fields))  # No visible tab stops.
         self.assertEqual([row[2] for row in fields], [
             "* ▾ \033[2m(2m ago)\033[0m \033[34mwork\033[0m",
-            "    └─ * \033[2m~2m ago\033[0m Fix login \033[2mrepo\033[0m",
+            "    └─ * \033[2m~2m ago\033[0m Fix login \033[2m[Pi] repo\033[0m",
         ])
         self.assertNotIn("model-name", data)
         self.assertNotIn("investigate auth", data)

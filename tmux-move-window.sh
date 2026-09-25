@@ -9,6 +9,7 @@
 #          display-popup -E "~/.config/tmux/tmux-move-window.sh"
 #
 # fzf --print-query lets you pick an existing session OR type a new name to create it.
+# New sessions also give the moved window their name; existing sessions keep its name.
 # Testing hook: set MW_DEST=<name> to skip fzf; args $1/$2 override the stashed source.
 set -euo pipefail
 
@@ -51,6 +52,8 @@ if [ "$created" = 1 ]; then
     | grep -vFx "$src_win" \
     | while read -r w; do tmux kill-window -t "$w"; done
   tmux move-window -r -t "=$choice:"        # renumber so our window sits at base-index
+  tmux set-option -w -t "$src_win" automatic-rename off
+  tmux rename-window -t "$src_win" "$choice"
 fi
 
 tmux select-window -t "$src_win" 2>/dev/null || true

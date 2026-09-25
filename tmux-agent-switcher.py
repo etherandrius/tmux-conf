@@ -3,8 +3,8 @@
 
 Process discovery and saved-session matching follow meta-workstrees' audit, but
 TTY identity (never cwd) determines navigation. No dependency on that checkout.
-Saved metadata is best-effort: Pi does not publish its current session file to
-other processes. In particular, /new and /resume can outlive process start time.
+Saved metadata is best-effort for both Pi and Claude Code. In particular,
+/new and /resume can outlive process start time.
 """
 from __future__ import annotations
 
@@ -96,12 +96,30 @@ def is_pi(process):
             and "/pi-coding-agent/" in argv[1] and argv[1].endswith("/cli.js"))
 
 
-def ancestor_is_pi(process, processes):
+def agent_kind(process):
+    if is_pi(process):
+        return "pi"
+    command = Path(process["command"]).name
+    try:
+        argv = shlex.split(process["args"])
+    except ValueError:
+        argv = []
+    first = Path(argv[0]).name if argv else ""
+    if command == "claude" or first == "claude":
+        return "claude"
+    # npm installs may still appear as node instead of the native binary/title.
+    if (command in ("node", "nodejs", "bun") and len(argv) > 1
+            and "/@anthropic-ai/claude-code/" in argv[1] and argv[1].endswith("/cli.js")):
+        return "claude"
+    return ""
+
+
+def ancestor_is_agent(process, processes):
     seen = {process["pid"]}
     parent = process["parent"]
     while parent in processes and parent not in seen:
         seen.add(parent)
-        if is_pi(processes[parent]):
+        if agent_kind(processes[parent]):
             return True
         parent = processes[parent]["parent"]
     return False
@@ -117,7 +135,7 @@ def parse_panes(output):
 
 
 def find_agents(processes, panes, current_session):
-    """Only top-level Pi processes with an actual tmux controlling terminal.
+    """Only top-level Pi/Claude processes with an actual tmux controlling terminal.
 
     Child/headless agents often inherit TMUX_PANE, so that environment variable
     is NOT evidence they have an interactive pane. Detached workers are omitted.
@@ -131,20 +149,28 @@ def find_agents(processes, panes, current_session):
     agents = []
     for process in processes.values():
         pane = by_tty.get(process["tty"])
-        if not pane or not is_pi(process) or ancestor_is_pi(process, processes):
+        kind = agent_kind(process)
+        if not pane or not kind or ancestor_is_agent(process, processes):
             continue
-        # Explicit print/RPC invocations aren't navigable interactive agents.
+        # Explicit print/RPC/background invocations aren't interactive agents.
         try:
             argv = shlex.split(process["args"])
         except ValueError:
             argv = []
-        if any(arg in ("-p", "--print", "--mode=json", "--mode=rpc") for arg in argv):
+        if any(arg in ("-p", "--print") or arg.startswith("--print=") for arg in argv):
             continue
-        if "--mode" in argv and any(mode in argv for mode in ("json", "rpc")):
-            continue
-        agents.append({**pane, **process, "cwd": pane["pane_current_path"],
+        if kind == "pi":
+            if any(arg in ("--mode=json", "--mode=rpc") for arg in argv):
+                continue
+            if "--mode" in argv and any(mode in argv for mode in ("json", "rpc")):
+                continue
+        else:
+            cli_args = argv[2:] if argv and Path(argv[0]).name in ("node", "nodejs", "bun") else argv[1:]
+            if cli_args[:1] in (["bg-pty-host"], ["bg-spare"]) or cli_args[:2] == ["daemon", "run"]:
+                continue
+        agents.append({**pane, **process, "agent": kind, "cwd": pane["pane_current_path"],
                        "started": 0.0})
-    # Shell job control can leave several Pi processes on one TTY. There is
+    # Shell job control can leave several agents on one TTY. There is
     # only one screen to navigate to: prefer its foreground job, once per pane.
     by_pane = {}
     for agent in sorted(agents, key=lambda a: ("+" not in a["state"], -a["pid"])):
@@ -198,7 +224,7 @@ def session_roots():
 def reverse_entries(path, wanted=None):
     """Read backwards; skip JSON decoding for record types no longer needed.
 
-    Pi writes literal type names. The byte check is only a prefilter: JSON is
+    Both agents write literal type names. The byte check is only a prefilter: JSON is
     still decoded and its top-level type checked by callers. `wanted` may shrink
     while iterating, avoiding decoding large historical tool/image payloads.
     """
@@ -249,7 +275,9 @@ def session_name(path):
     return ""
 
 
-def session_metadata(path):
+def session_metadata(path, kind="pi"):
+    if kind == "claude":
+        return claude_session_metadata(path)
     data = {}
     wanted = {"session_info", "thinking_level_change", "model_change", "message"}
     for entry in reverse_entries(path, wanted):
@@ -286,7 +314,86 @@ def session_metadata(path):
     return data
 
 
-def session_candidates(cwds):
+def claude_session_metadata(path):
+    """Claude messages are top-level user/assistant records, not Pi messages.
+
+    Tool results also have type=user; they must not replace the user's prompt.
+    Explicit /rename titles take priority over auto-generated titles.
+    """
+    data, titles = {}, {}
+    wanted = {"custom-title", "ai-title", "user", "assistant"}
+    for entry in reverse_entries(path, wanted):
+        if entry.get("isSidechain"):
+            continue
+        kind = entry.get("type")
+        if kind in ("custom-title", "ai-title") and kind in wanted:
+            titles[kind] = clean(entry.get("customTitle" if kind == "custom-title" else "aiTitle"))
+            wanted.discard(kind)
+        elif kind in ("user", "assistant") and isinstance(entry.get("message"), dict):
+            message = entry["message"]
+            if "last_message" not in data:
+                saved_time = timestamp(entry.get("timestamp"))
+                if saved_time:
+                    data["last_message"] = saved_time
+                    data["last_role"] = kind
+            content = message.get("content")
+            tool_result = "toolUseResult" in entry or (isinstance(content, list) and any(
+                isinstance(block, dict) and block.get("type") == "tool_result" for block in content))
+            if kind == "user" and "prompt" not in data and not entry.get("isMeta") and not tool_result:
+                prompt = text_content(content)
+                if prompt:
+                    data["prompt"] = prompt[:500]
+            if kind == "assistant" and "model" not in data and clean(message.get("model")):
+                data["model"] = clean(message["model"])
+                data["thinking"] = clean(entry.get("effort"))
+        if all(key in data for key in ("last_message", "prompt", "model")):
+            wanted.difference_update(("user", "assistant"))
+        if not wanted:
+            break
+    data["name"] = titles.get("custom-title") or titles.get("ai-title", "")
+    return data
+
+
+def claude_session_candidates(cwds):
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser() / "projects"
+    candidates, seen = [], set()
+    # Deliberately not recursive: nested subagents/ transcripts aren't pane sessions.
+    for path in root.glob("*/*.jsonl"):
+        if path.name.startswith("agent-"):  # Older sidechain transcript layout.
+            continue
+        try:
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                for _, line in zip(range(100), handle):
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("isSidechain"):
+                        break
+                    cwd = entry.get("cwd")
+                    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+                        continue
+                    cwd = os.path.abspath(cwd)
+                    if cwd in cwds:
+                        candidates.append(dict(path=str(resolved), cwd=cwd, agent="claude",
+                                               created=timestamp(entry.get("timestamp")),
+                                               mtime=path.stat().st_mtime,
+                                               session_id=clean(entry.get("sessionId")) or path.stem))
+                    break
+        except OSError:
+            continue
+    return candidates
+
+
+def session_candidates(cwds, kind="pi"):
+    if kind == "claude":
+        return claude_session_candidates(cwds)
     candidates, seen = [], set()
     for root in session_roots():
         for path in root.glob("**/*.jsonl"):
@@ -302,13 +409,18 @@ def session_candidates(cwds):
                 cwd = header.get("cwd")
                 if not isinstance(cwd, str) or not os.path.isabs(cwd) or os.path.abspath(cwd) not in cwds:
                     continue
-                candidates.append(dict(path=str(resolved), cwd=os.path.abspath(cwd),
+                candidates.append(dict(path=str(resolved), cwd=os.path.abspath(cwd), agent="pi",
                                        created=timestamp(header.get("timestamp")),
                                        mtime=path.stat().st_mtime,
                                        session_id=clean(header.get("id"))))
             except (OSError, ValueError, UnicodeError):
                 continue
     return candidates
+
+
+def pane_name(agent):
+    # A pane can retain Pi's option after switching to Claude. Never reuse it.
+    return clean(agent.get("@pi_session_name")) if agent.get("agent", "pi") == "pi" else ""
 
 
 def match_sessions(agents, candidates):
@@ -328,18 +440,21 @@ def match_sessions(agents, candidates):
         return names[path]
 
     # Named panes claim their files first, before unnamed panes in the same cwd.
-    for agent in sorted(agents, key=lambda a: (not bool(a["@pi_session_name"]), -a["started"])):
-        if "--no-session" in agent["args"].split():
+    for agent in sorted(agents, key=lambda a: (not bool(pane_name(a)), -a["started"])):
+        kind = agent.get("agent", "pi")
+        ephemeral_flag = "--no-session" if kind == "pi" else "--no-session-persistence"
+        if ephemeral_flag in agent["args"].split():
             continue
-        matches = [c for c in available if c["cwd"] == os.path.abspath(agent["cwd"])]
-        name = clean(agent["@pi_session_name"])
+        matches = [c for c in available if c.get("agent", "pi") == kind
+                   and c["cwd"] == os.path.abspath(agent["cwd"])]
+        name = pane_name(agent)
         # Newest first, stopping at the first matching name. Don't parse full
         # metadata for every historical session just to find a display name.
         candidate = next((c for c in matches if not name or name_of(c) == name), None)
         if candidate is None:
             continue
         available.remove(candidate)
-        agent["saved"] = {**candidate, **session_metadata(Path(candidate["path"]))}
+        agent["saved"] = {**candidate, **session_metadata(Path(candidate["path"]), kind)}
         agent["match"] = "pane name + cwd" if name else "cwd + recency"
 
 
@@ -349,14 +464,20 @@ def discover(current_session):
     processes = parse_processes(run(["ps", "-axo", "pid=,ppid=,tty=,stat=,comm=,args="]).stdout)
     agents = find_agents(processes, panes, current_session)
     process_details(agents)
-    if agents:
-        match_sessions(agents, session_candidates({os.path.abspath(a["cwd"]) for a in agents}))
+    for kind in ("pi", "claude"):
+        group = [a for a in agents if a["agent"] == kind]
+        if group:
+            match_sessions(group, session_candidates({os.path.abspath(a["cwd"]) for a in group}, kind))
     return agents
 
 
+def agent_label(agent):
+    return "Claude" if agent.get("agent", "pi") == "claude" else "Pi"
+
+
 def display_name(agent):
-    return (clean(agent["@pi_session_name"]) or agent.get("saved", {}).get("name")
-            or Path(agent["cwd"]).name or "unnamed Pi")
+    return (pane_name(agent) or agent.get("saved", {}).get("name")
+            or Path(agent["cwd"]).name or "unnamed " + agent_label(agent))
 
 
 def location(agent):
@@ -377,10 +498,10 @@ def matching_names(agents, query):
 
 
 def rows(agents, current_session, current_pane, query=""):
-    """Session headings with Pi children, matching the window switcher's tree.
+    """Session headings with agent children, matching the window switcher's tree.
 
     Two hidden fields hold the target pane and row identity. A session heading
-    previews/navigates to its first Pi child; it doesn't add a snapshot entry.
+    previews/navigates to its first child; it doesn't add a snapshot entry.
     """
     matches = matching_names(agents, query) if query else None
     sessions = {}
@@ -392,7 +513,7 @@ def rows(agents, current_session, current_pane, query=""):
     output = []
     for group in groups:
         # Session-name matches retain the entire group. Otherwise retain only
-        # matching Pi children, then rebuild their heading and tree connectors.
+        # matching children, then rebuild their heading and tree connectors.
         if matches is not None and group[0]["session_id"] not in matches:
             group = [agent for agent in group if agent["pane_id"] in matches]
         if not group:
@@ -417,7 +538,7 @@ def rows(agents, current_session, current_pane, query=""):
             # Tabs delimit hidden IDs only; visible fields use single spaces.
             # Name matching is handled separately by matching_names().
             label = (f'    {branch}─ {marker}\033[2m{last}\033[0m '
-                     f'{display_name(agent)} \033[2m{folder}\033[0m')
+                     f'{display_name(agent)} \033[2m[{agent_label(agent)}] {folder}\033[0m')
             output.append(f'{agent["pane_id"]}\t{agent["pane_id"]}\t{label}')
     return "\n".join(output) + ("\n" if output else "")
 
@@ -452,21 +573,22 @@ def load_agent(snapshot, pane):
 def still_running(agent):
     result = run(["ps", "-p", str(agent["pid"]), "-o", "pid=,ppid=,tty=,stat=,comm=,args="])
     process = parse_processes(result.stdout).get(agent["pid"])
-    return bool(process and is_pi(process) and process["tty"] == agent["tty"])
+    return bool(process and agent_kind(process) == agent.get("agent", "pi")
+                and process["tty"] == agent["tty"])
 
 
 def preview(snapshot, pane):
     agent = load_agent(snapshot, pane)
     if not agent:
-        print("No live Pi agents in tmux. Ctrl-R to refresh; Esc to close.")
+        print("No live Pi or Claude agents in tmux. Ctrl-R to refresh; Esc to close.")
         return
     if not still_running(agent):
-        print("This Pi agent has exited. Ctrl-R to refresh the list.")
+        print("This agent has exited. Ctrl-R to refresh the list.")
         return
     saved = agent.get("saved", {})
     # Refresh saved fields when previewing, without rescanning the whole machine.
     if saved:
-        saved = {**saved, **session_metadata(Path(saved["path"]))}
+        saved = {**saved, **session_metadata(Path(saved["path"]), agent.get("agent", "pi"))}
     branch = run(["git", "-C", agent["cwd"], "symbolic-ref", "--short", "HEAD"], timeout=1).stdout.strip()
     if not branch:
         branch = run(["git", "-C", agent["cwd"], "rev-parse", "--short", "HEAD"], timeout=1).stdout.strip()
@@ -476,10 +598,10 @@ def preview(snapshot, pane):
         last += ":" + saved["last_tool"]
     match = f'~ saved metadata ({agent["match"]}; best-effort)' if saved else "Saved metadata unavailable"
     header = [
-        f'\033[1m{display_name(agent)}\033[0m',
+        f'\033[1m{display_name({**agent, "saved": saved})}\033[0m · {agent_label(agent)}',
         f'Tmux: {clean(location(agent))} · {clean(agent["window_name"])} · {pane} · PID {agent["pid"]}',
         f'Cwd: {clean(short_path(agent["cwd"]))}' + (f'  [{clean(branch)}]' if branch else ""),
-        f'Model: {model} · thinking: {saved.get("thinking", "unknown")}',
+        f'Model: {model} · thinking: {saved.get("thinking") or "unknown"}',
         f'Last saved: {age(saved.get("last_message"))} ({last}) · started {age(agent["started"])}',
         f'Prompt: {saved.get("prompt") or "unavailable"}',
         match,
@@ -490,7 +612,7 @@ def preview(snapshot, pane):
     if result.returncode:
         print("Pane is no longer available. Ctrl-R to refresh.")
     else:
-        # Keep the bottom of the screen, including Pi's editor/footer, in view.
+        # Keep the bottom of the screen, including the editor/footer, in view.
         height = max(1, int(os.environ.get("FZF_PREVIEW_LINES", "50")) - len(header))
         print("\n".join(result.stdout.splitlines()[-height:]), end="\033[0m\n")
 
@@ -532,7 +654,7 @@ def pick():
         pane = result.stdout.split("\t", 1)[0].strip()
         agent = load_agent(snapshot, pane)
         if not agent or not still_running(agent):
-            run(["tmux", "display-message", "-c", client, "Pi agent exited; reopen Ctrl-g t to refresh."])
+            run(["tmux", "display-message", "-c", client, "Agent exited; reopen Ctrl-g t to refresh."])
             return 0
         target = f'{agent["session_id"]}:{agent["window_id"]}.{pane}'
         switched = run(["tmux", "switch-client", "-c", client, "-t", target])

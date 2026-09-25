@@ -2,7 +2,7 @@
 # Fuzzy replacements for tmux's default choose-tree bindings:
 #   <prefix> s  -> sessions
 #   <prefix> w  -> windows across all sessions
-#   <prefix> t  -> live Pi agents across all sessions
+#   <prefix> t  -> live Pi and Claude agents across all sessions
 set -euo pipefail
 
 mode=${1:-}
